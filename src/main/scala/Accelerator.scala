@@ -22,7 +22,6 @@ class Accelerator extends Module {
   val yReg = RegInit(0.U(5.W))
   val centerPixelReg = RegInit(0.U(32.W))
   val neighborCounter = RegInit(0.U(3.W))
-  val erodeFlag = RegInit(false.B)
   val outputPixelReg = RegInit(0.U(32.W))
 
   // default
@@ -66,7 +65,6 @@ class Accelerator extends Module {
       }
       .otherwise {
         neighborCounter := 0.U
-        erodeFlag := false.B
         stateReg := set_neighbor_addr
       }
     }
@@ -96,17 +94,17 @@ class Accelerator extends Module {
       io.address := neighborAddr
 
       when(io.dataRead === 0.U) {
-        erodeFlag := true.B
-      }
-
-      when(neighborCounter === 3.U) {
-        when(erodeFlag || io.dataRead === 0.U) {
-          outputPixelReg := 0.U
-        }.otherwise {
-          outputPixelReg := 255.U
-        }
+        // Found black neighbor - exit immediately!
+        outputPixelReg := 0.U
         stateReg := write
-      }.otherwise {
+      }
+      .elsewhen(neighborCounter === 3.U) {
+        // Checked all 4 neighbors, none were black
+        outputPixelReg := 255.U
+        stateReg := write
+      }
+      .otherwise {
+        // Keep checking next neighbor
         neighborCounter := neighborCounter + 1.U
         stateReg := set_neighbor_addr
       }
