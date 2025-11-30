@@ -24,6 +24,14 @@ class Accelerator extends Module {
   val neighborCounter = RegInit(0.U(3.W))
   val outputPixelReg = RegInit(0.U(32.W))
 
+  // Spatial locality cache - stores previous center pixel for reuse as left neighbor
+  val cachedLeftNeighbor = RegInit(0.U(32.W))
+  val canUseCachedLeft = RegInit(false.B)
+
+  // Line buffer - stores entire previous row for top neighbor reuse
+  val lineBuffer = RegInit(VecInit(Seq.fill(20)(0.U(32.W))))
+  val lineBufferValid = RegInit(false.B)
+
   // default
   io.done := false.B
   io.writeEnable := false.B
@@ -47,36 +55,81 @@ class Accelerator extends Module {
     }
 
     is(set_center_addr) {
-      io.address := pixelAddress(xReg, yReg)
-      stateReg := read_center
+      when(isBorder) {
+        // Border pixels are always black - skip reading entirely
+        outputPixelReg := 0.U
+        stateReg := write
+      }.otherwise {
+        io.address := pixelAddress(xReg, yReg)
+        stateReg := read_center
+      }
     }
 
     is(read_center) {
       io.address := pixelAddress(xReg, yReg)
       centerPixelReg := io.dataRead
 
-      when(isBorder) {
-        outputPixelReg := 0.U
-        stateReg := write
+      // Store in line buffer for next row's top neighbor
+      lineBuffer(xReg) := io.dataRead
+
+      // Cache center pixel for next pixel's left neighbor (if not last in row)
+      when(xReg < 19.U) {
+        cachedLeftNeighbor := io.dataRead
+        canUseCachedLeft := true.B
       }
-      .elsewhen(io.dataRead === 0.U) {
+
+      when(io.dataRead === 0.U) {
+        // Black center pixel stays black
         outputPixelReg := 0.U
         stateReg := write
       }
       .otherwise {
-        neighborCounter := 0.U
-        stateReg := set_neighbor_addr
+        // White center pixel - need to check neighbors
+        // Check cached neighbors first (left and top)
+        val cachedLeftIsBlack = canUseCachedLeft && cachedLeftNeighbor === 0.U
+        val cachedTopIsBlack = lineBufferValid && lineBuffer(xReg) === 0.U
+
+        when(cachedLeftIsBlack || cachedTopIsBlack) {
+          // Found black neighbor in cache - erode immediately
+          outputPixelReg := 0.U
+          stateReg := write
+        }.elsewhen(canUseCachedLeft && lineBufferValid) {
+          // Both left and top cached and white - skip to right neighbor
+          neighborCounter := 1.U
+          stateReg := set_neighbor_addr
+        }.elsewhen(canUseCachedLeft) {
+          // Only left cached - skip to right, will check top later
+          neighborCounter := 1.U
+          stateReg := set_neighbor_addr
+        }.elsewhen(lineBufferValid) {
+          // Only top cached - start from left, will skip top later
+          neighborCounter := 0.U
+          stateReg := set_neighbor_addr
+        }.otherwise {
+          // No cache - start checking from left neighbor
+          neighborCounter := 0.U
+          stateReg := set_neighbor_addr
+        }
       }
     }
 
     is(set_neighbor_addr) {
       val neighborAddr = WireDefault(0.U(16.W))
 
-      switch(neighborCounter) {
-        is(0.U) { neighborAddr := pixelAddress(xReg - 1.U, yReg) }
-        is(1.U) { neighborAddr := pixelAddress(xReg + 1.U, yReg) }
-        is(2.U) { neighborAddr := pixelAddress(xReg, yReg - 1.U) }
-        is(3.U) { neighborAddr := pixelAddress(xReg, yReg + 1.U) }
+      // Skip top neighbor (index 2) if already cached in line buffer
+      val shouldSkipTop = (neighborCounter === 2.U) && lineBufferValid
+
+      when(shouldSkipTop) {
+        // Skip top neighbor - jump to bottom neighbor
+        neighborCounter := 3.U
+        neighborAddr := pixelAddress(xReg, yReg + 1.U)
+      }.otherwise {
+        switch(neighborCounter) {
+          is(0.U) { neighborAddr := pixelAddress(xReg - 1.U, yReg) }
+          is(1.U) { neighborAddr := pixelAddress(xReg + 1.U, yReg) }
+          is(2.U) { neighborAddr := pixelAddress(xReg, yReg - 1.U) }
+          is(3.U) { neighborAddr := pixelAddress(xReg, yReg + 1.U) }
+        }
       }
 
       io.address := neighborAddr
@@ -118,8 +171,14 @@ class Accelerator extends Module {
       when(xReg === 19.U && yReg === 19.U) {
         stateReg := done
       }.elsewhen(xReg === 19.U) {
+        // End of row - invalidate left cache, enable line buffer for new row
         xReg := 0.U
         yReg := yReg + 1.U
+        canUseCachedLeft := false.B
+        // Line buffer becomes valid after first row (y=0) is complete
+        when(yReg === 0.U) {
+          lineBufferValid := true.B
+        }
         stateReg := set_center_addr
       }.otherwise {
         xReg := xReg + 1.U
